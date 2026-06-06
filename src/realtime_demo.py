@@ -78,19 +78,19 @@ class RealtimeDemoApp:
         self.scorer    = DrowsinessScorer(history_len=20)
         self.alerter   = AlertGenerator()
 
-        # ── Telemetry replay ──────────────────────────────────────────────
+        # ── Telemetry replay (disabled for M5-only test) ─────────────────
         self.replayer: Optional[TelemetryReplayer] = None
         self._latest_tele = dict(pitch=0., roll=0., speed=0., rpm=0., gear=0.)
 
-        if telemetry_csv and Path(telemetry_csv).exists():
-            self.replayer = TelemetryReplayer(
-                telemetry_csv, loop=True, speed_factor=speed_factor
-            )
-            print(f"✓ Telemetry replay: {Path(telemetry_csv).name}")
-        else:
-            print("ℹ  No telemetry CSV — CAN will be simulated (random walk).")
+        # if telemetry_csv and Path(telemetry_csv).exists():
+        #     self.replayer = TelemetryReplayer(
+        #         telemetry_csv, loop=True, speed_factor=speed_factor
+        #     )
+        #     print(f"✓ Telemetry replay: {Path(telemetry_csv).name}")
+        # else:
+        #     print("ℹ  No telemetry CSV — CAN will be simulated (random walk).")
 
-        # ── Ring buffers @ 4 Hz ───────────────────────────────────────────
+        # ── Ring buffers @ 4 Hz (not used by M5) ─────────────────────────
         self.rt_buf   = RingBuffer(WINDOW, N_RT_FEAT)   # for M4
         self.tele_buf = RingBuffer(WINDOW, N_TELE)      # for M2/M3
 
@@ -138,28 +138,27 @@ class RealtimeDemoApp:
         else:
             self.rt_buf.push(np.zeros(N_RT_FEAT, dtype=np.float32))
 
-        # Drain telemetry replay or simulate
-        if self.replayer:
-            rows = self.replayer.drain_to_array()
-            if len(rows):
-                self.tele_buf.push_batch(rows)
-                t = rows[-1]
-                self._latest_tele = dict(
-                    pitch=float(t[0]), roll=float(t[1]),
-                    speed=float(t[2]), rpm=float(t[3]), gear=float(t[4])
-                )
-        else:
-            # Gentle random walk
-            for k, lo, hi, step in [('speed', 30, 90, 2), ('rpm', 800, 3500, 50),
-                                      ('pitch', -5, 5, .3), ('roll', -5, 5, .3),
-                                      ('gear', 1, 6, 0)]:
-                self._latest_tele[k] = float(np.clip(
-                    self._latest_tele[k] + np.random.uniform(-step, step), lo, hi
-                ))
-            self.tele_buf.push(np.array(
-                [self._latest_tele[k] for k in ['pitch', 'roll', 'speed', 'rpm', 'gear']],
-                dtype=np.float32
-            ))
+        # Telemetry drain/simulate disabled for M5-only test
+        # if self.replayer:
+        #     rows = self.replayer.drain_to_array()
+        #     if len(rows):
+        #         self.tele_buf.push_batch(rows)
+        #         t = rows[-1]
+        #         self._latest_tele = dict(
+        #             pitch=float(t[0]), roll=float(t[1]),
+        #             speed=float(t[2]), rpm=float(t[3]), gear=float(t[4])
+        #         )
+        # else:
+        #     for k, lo, hi, step in [('speed', 30, 90, 2), ('rpm', 800, 3500, 50),
+        #                               ('pitch', -5, 5, .3), ('roll', -5, 5, .3),
+        #                               ('gear', 1, 6, 0)]:
+        #         self._latest_tele[k] = float(np.clip(
+        #             self._latest_tele[k] + np.random.uniform(-step, step), lo, hi
+        #         ))
+        #     self.tele_buf.push(np.array(
+        #         [self._latest_tele[k] for k in ['pitch', 'roll', 'speed', 'rpm', 'gear']],
+        #         dtype=np.float32
+        #     ))
         return True
 
     def _run_inference(self) -> None:
@@ -186,21 +185,15 @@ class RealtimeDemoApp:
                     probs = self.predictor.predict_image(self._latest_face_crop)
                     self._current_score = self.scorer.update(probs)
                 elif mt == 'm1':
-                    if not self.rt_buf.is_ready():
-                        return
-                    w = self.rt_buf.get()[np.newaxis].astype(np.float32)  # (1,240,10)
-                    probs = self.predictor.model.predict(w, verbose=0)[0]
-                    self._current_score = self.scorer.update(probs)
+                    # M1 expects FAU 30-feat — fall back to rule-based if no FAU buffer
+                    pass
                 elif mt == 'm4':
                     w     = self.rt_buf.get()[np.newaxis]   # (1,240,10)
                     probs = self.predictor.model.predict(w, verbose=0)[0]
                     self._current_score = self.scorer.update(probs)
                 elif mt == 'm3' and self.tele_buf.is_ready():
-                    # M3 FAU branch expects (1, 240, 30) — pad 10 rt features to 30
-                    rt10 = self.rt_buf.get().astype(np.float32)          # (240, 10)
-                    pad  = np.zeros((rt10.shape[0], N_FAU - rt10.shape[1]), dtype=np.float32)
-                    wf   = np.concatenate([rt10, pad], axis=1)[np.newaxis]  # (1, 240, 30)
-                    wt   = self.tele_buf.get()[np.newaxis].astype(np.float32)
+                    wf = self.rt_buf.get()[np.newaxis].astype(np.float32)
+                    wt = self.tele_buf.get()[np.newaxis].astype(np.float32)
                     probs = self.predictor.model.predict([wf, wt], verbose=0)[0]
                     self._current_score = self.scorer.update(probs)
                 else:
@@ -244,21 +237,21 @@ class RealtimeDemoApp:
                         (200, 230, 200), 1)
             y += 16
 
-        # Telemetry panel (top-right)
-        t = self._latest_tele
-        src = "Replay" if self.replayer else "Simulated"
-        tele_lines = [
-            f"[CAN | {src}]",
-            f"Speed: {t['speed']:.1f} m/s",
-            f"RPM  : {t['rpm']:.0f}",
-            f"Gear : {t['gear']:.0f}",
-            f"Pitch: {t['pitch']:.1f}°",
-            f"Roll : {t['roll']:.1f}°",
-        ]
-        tw = out.shape[1]
-        for i, line in enumerate(tele_lines):
-            cv2.putText(out, line, (tw - 230, 22 + i * 18), FONT, 0.42,
-                        (200, 200, 50), 1)
+        # Telemetry panel disabled for M5-only test
+        # t = self._latest_tele
+        # src = "Replay" if self.replayer else "Simulated"
+        # tele_lines = [
+        #     f"[CAN | {src}]",
+        #     f"Speed: {t['speed']:.1f} m/s",
+        #     f"RPM  : {t['rpm']:.0f}",
+        #     f"Gear : {t['gear']:.0f}",
+        #     f"Pitch: {t['pitch']:.1f}°",
+        #     f"Roll : {t['roll']:.1f}°",
+        # ]
+        # tw = out.shape[1]
+        # for i, line in enumerate(tele_lines):
+        #     cv2.putText(out, line, (tw - 230, 22 + i * 18), FONT, 0.42,
+        #                 (200, 200, 50), 1)
 
         # Prediction panel (bottom)
         bh = out.shape[0]
@@ -281,8 +274,8 @@ class RealtimeDemoApp:
         Start webcam + telemetry replay loop.
         Press 'q' to quit.
         """
-        if self.replayer:
-            self.replayer.start()
+        # if self.replayer:
+        #     self.replayer.start()
 
         cap = cv2.VideoCapture(webcam_index)
         if not cap.isOpened():
@@ -345,12 +338,8 @@ class RealtimeDemoApp:
             if writer:
                 writer.release()
             cv2.destroyAllWindows()
-            if self.replayer:
-                self.replayer.stop()
-            try:
-                self.analyzer.extractor._landmarker.close()
-            except Exception:
-                pass
+            # if self.replayer:
+            #     self.replayer.stop()
             print("Demo stopped.")
 
 
@@ -362,19 +351,19 @@ if __name__ == '__main__':
     # ── Configure ─────────────────────────────────────────────────────────────
     ULDD_ROOT = Path(r"C:/Users/raka1005/Documents/IISC/UL-DD")
 
-    # Telemetry CSV (simulated random walk if path doesn't exist)
-    TELEMETRY_CSV = (
-        ULDD_ROOT / "CSV_Files" / "CSV_Files" / "CSV_Files"
-        / "B" / "A" / "B_Telemetry_A.csv"
-    )
+    # Telemetry CSV disabled for M5-only test
+    # TELEMETRY_CSV = (
+    #     ULDD_ROOT / "CSV_Files" / "CSV_Files" / "CSV_Files"
+    #     / "B" / "A" / "B_Telemetry_A.csv"
+    # )
 
     # Trained model checkpoint
-    MODEL_PATH  = Path(__file__).parent.parent / 'models' / 'checkpoints' / 'M3_fold0.keras'
-    MODEL_TYPE  = 'm3'    # 'm1' | 'm2' | 'm3' | 'm4' | 'm5'
+    MODEL_PATH  = Path(__file__).parent.parent / 'models' / 'checkpoints' / 'M5_fold0.pt'
+    MODEL_TYPE  = 'm5'    # 'm1' | 'm2' | 'm3' | 'm4' | 'm5'
     # ─────────────────────────────────────────────────────────────────────────
 
     app = RealtimeDemoApp(
-        telemetry_csv = str(TELEMETRY_CSV) if TELEMETRY_CSV.exists() else None,
+        telemetry_csv = None,   # disabled for M5-only test
         model_path    = str(MODEL_PATH),
         model_type    = MODEL_TYPE,
         yolo_model    = 'yolov8n.pt',

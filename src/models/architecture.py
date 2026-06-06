@@ -330,11 +330,14 @@ def build_model(name: str, **kwargs) -> Model:
     Build a model by short name.
 
     Args:
-        name : 'm1' | 'm2' | 'm3' | 'm4'
+        name : 'm1' | 'm2' | 'm3' | 'm4' | 'm6_lite' | 'm6_full'
+               (M5 is a YOLOv8-cls model trained via the ultralytics CLI;
+               M6 is implemented in PyTorch — see `src.models.m6_fusion`.)
         **kwargs : forwarded to the specific builder / class
 
     Returns:
-        tf.keras.Model
+        tf.keras.Model  for m1–m4
+        torch.nn.Module for m6_lite / m6_full
     """
     name = name.lower()
     if name == 'm1':
@@ -345,6 +348,11 @@ def build_model(name: str, **kwargs) -> Model:
         return M3FusionModel(**kwargs)
     if name == 'm4':
         return build_m4_realtime_bilstm(**kwargs)
+    if name in ('m6', 'm6_full', 'm6_lite'):
+        from .m6_fusion import build_m6
+        variant = 'lite' if name == 'm6_lite' else 'full'
+        return build_m6(variant, **kwargs)
     raise ValueError(
-        f"Unknown model: {name!r}.  Choose from: m1 | m2 | m3 | m4"
+        f"Unknown model: {name!r}.  "
+        "Choose from: m1 | m2 | m3 | m4 | m6_lite | m6_full"
     )
