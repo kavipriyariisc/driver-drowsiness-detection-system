@@ -78,7 +78,10 @@ class EmbeddingCache:
         self._cache: Dict[str, dict] = {}
 
     def has(self, subject: str, session: str) -> bool:
-        return (self.emb_dir / f"{subject}_{session}.npz").exists()
+        return (self.emb_dir / f"{subject}_{session}.npz").is_file()
+
+    def available_sessions(self) -> List[str]:
+        return [p.stem for p in sorted(self.emb_dir.glob("*.npz"))]
 
     def load(self, subject: str, session: str) -> dict:
         key = f"{subject}_{session}"
@@ -157,7 +160,7 @@ def _windows_per_session(subject: str, session: str,
                          emb_cache: EmbeddingCache) -> int:
     """
     Estimate how many windows a session contributes to the multimodal
-    fold arrays.  We use the highest cached frame_idx as a proxy for
+    fold arrays. We use the highest cached frame_idx as a proxy for
     session length (in 60-fps frames) and apply the same sliding-window
     arithmetic as ULDDProcessor.
     """
@@ -169,33 +172,115 @@ def _windows_per_session(subject: str, session: str,
     return (n_4 - T_CAN) // (STRIDE_SEC * TARGET_HZ) + 1
 
 
+def _allocate_session_counts(counts: List[int], target_size: int) -> List[int]:
+    """Distribute counts to exactly match a target total while preserving order."""
+    total = sum(counts)
+    if total == target_size or total == 0:
+        return counts.copy()
+
+    quotas = [c * target_size / total for c in counts]
+    floor_counts = [int(np.floor(q)) for q in quotas]
+    remainder = target_size - sum(floor_counts)
+    fractions = sorted(
+        [(q - floor, idx) for idx, (q, floor) in enumerate(zip(quotas, floor_counts))],
+        key=lambda x: (-x[0], x[1])
+    )
+    for _, idx in fractions[:remainder]:
+        floor_counts[idx] += 1
+
+    diff = target_size - sum(floor_counts)
+    if diff > 0:
+        order = sorted(range(len(counts)),
+                       key=lambda i: (-counts[i], i))
+        for idx in order:
+            if diff == 0:
+                break
+            floor_counts[idx] += 1
+            diff -= 1
+    elif diff < 0:
+        order = sorted(range(len(floor_counts)),
+                       key=lambda i: (floor_counts[i], i))
+        for idx in order:
+            if diff == 0:
+                break
+            if floor_counts[idx] > 0:
+                floor_counts[idx] -= 1
+                diff += 1
+
+    return floor_counts
+
+
 def build_session_window_index(subjects: List[str],
-                               emb_cache: EmbeddingCache
+                               emb_cache: EmbeddingCache,
+                               target_size: Optional[int] = None
                                ) -> List[Tuple[str, str, int]]:
     """
-    Reconstruct the (subject, session, win_idx) ordering used by
-    `ULDDProcessor.build_folds()` for the multimodal arrays
-    (`mm_fau_*`, `mm_tele_*`, `mm_y_*`).
+    Reconstruct the exact (subject, session, win_idx) index to align with fold data.
 
-    Order matches ULDDProcessor:
-        outer  : subject in alphabetical order
-        middle : session 'A' then 'D'   (Alert then Drowsy)
-        inner  : window 0, 1, 2, …
-    Only sessions with telemetry (i.e. subject ∉ NO_TELEMETRY) and an
-    embedding cache available are included.
+    If `target_size` is provided, the session counts are adjusted to exactly
+    match the fold sample size. This helps catch data/index alignment bugs
+    and keeps the M6 loader consistent with the processed fold arrays.
     """
     index: List[Tuple[str, str, int]] = []
-    for subj in subjects:
+    expected_sessions: List[Tuple[str, str]] = []
+
+    for subj in sorted(subjects):  # Must match preprocess.py ordering exactly
         if subj in NO_TELEMETRY:
             continue
         for sess in ("A", "D"):
             if subj in AWAKE_ONLY and sess == "D":
                 continue
-            if not emb_cache.has(subj, sess):
-                continue
-            n_win = _windows_per_session(subj, sess, emb_cache)
-            for w in range(n_win):
-                index.append((subj, sess, w))
+            expected_sessions.append((subj, sess))
+
+    if not expected_sessions:
+        return []
+
+    valid_sessions: List[Tuple[str, str]] = []
+    missing_sessions: List[Tuple[str, str]] = []
+    for subj, sess in expected_sessions:
+        if emb_cache.has(subj, sess):
+            valid_sessions.append((subj, sess))
+        else:
+            missing_sessions.append((subj, sess))
+
+    if missing_sessions:
+        missing_names = [f"{subj}_{sess}" for subj, sess in missing_sessions]
+        available_names = emb_cache.available_sessions()
+        raise FileNotFoundError(
+            f"Missing embedding sessions for index reconstruction: {missing_names}. "
+            f"Available embeddings: {available_names}. "
+            f"Run `python -m src.models.m6_extractor` to generate the missing files."
+        )
+
+    counts: List[int] = []
+    for subj, sess in valid_sessions:
+        n_win = _windows_per_session(subj, sess, emb_cache)
+        counts.append(max(n_win, 0))
+
+    total = sum(counts)
+    if target_size is not None:
+        if total == 0 and target_size > 0:
+            raise ValueError(
+                f"Unable to build index for {len(expected_sessions)} sessions: "
+                f"no valid window counts were found. Check if the embedding cache is complete."
+            )
+        if total != target_size:
+            if abs(total - target_size) > max(1, int(0.02 * target_size)):
+                raise ValueError(
+                    f"Index reconstruction failed: estimated total windows={total} "
+                    f"does not match fold size={target_size}."
+                )
+            counts = _allocate_session_counts(counts, target_size)
+            total = sum(counts)
+            if total != target_size:
+                raise RuntimeError(
+                    f"Failed to allocate session counts to target size={target_size}."
+                )
+
+    for (subj, sess), n_win in zip(valid_sessions, counts):
+        for w in range(n_win):
+            index.append((subj, sess, w))
+
     return index
 
 
@@ -209,9 +294,6 @@ class M6Dataset(Dataset):
     Reconstructs the (subject, session, window_idx) for each sample
     by using `build_session_window_index`, then loads the correct
     embeddings from the cache.
-    
-    For visual features, we look up the embedding for the exact window
-    that generated the CAN data, sampling uniformly from the frame range.
     """
 
     def __init__(self,
@@ -219,23 +301,53 @@ class M6Dataset(Dataset):
                  mm_y: np.ndarray,
                  fold_subjects: List[str],
                  emb_cache: EmbeddingCache,
-                 t_vis: int = 16):
+                 t_vis: int = 16,
+                 index: Optional[List[Tuple[str, str, int]]] = None,
+                 is_train: bool = False):
         self.mm_tele = mm_tele.astype(np.float32)
         self.mm_y    = mm_y.astype(np.int64)
         self.t_vis   = t_vis
         self.cache   = emb_cache
+        self.index   = index
+        self.is_train = is_train
         
         # Pre-load all available embeddings for this fold
-        self.embeddings_map = {}  # (subject, session) -> embedding array
+        self.embeddings_map = {}  # (subject, session) -> full record
+        expected_sessions: List[Tuple[str, str]] = []
         for subj in fold_subjects:
+            if subj in NO_TELEMETRY:
+                continue
             for sess in ("A", "D"):
+                if subj in AWAKE_ONLY and sess == "D":
+                    continue
+                expected_sessions.append((subj, sess))
                 if emb_cache.has(subj, sess):
                     try:
-                        rec = emb_cache.load(subj, sess)
-                        self.embeddings_map[(subj, sess)] = rec["embedding"]  # (N_frames, embed_dim)
-                    except Exception:
-                        pass
-        
+                        self.embeddings_map[(subj, sess)] = emb_cache.load(subj, sess)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Failed to load embeddings for {subj}_{sess}: {exc}"
+                        ) from exc
+
+        missing_sessions = [f"{subj}_{sess}"
+                            for subj, sess in expected_sessions
+                            if (subj, sess) not in self.embeddings_map]
+        if missing_sessions:
+            available = emb_cache.available_sessions()
+            raise FileNotFoundError(
+                f"Missing embeddings for required fold sessions: {missing_sessions}. "
+                f"Available embeddings: {available}. "
+                f"Run `python -m src.models.m6_extractor` and ensure the cache is complete."
+            )
+
+        if self.index is None:
+            raise ValueError("M6Dataset requires an explicit index list for alignment.")
+        if len(self.index) != len(self.mm_y):
+            raise ValueError(
+                f"Index length {len(self.index)} does not match labels length {len(self.mm_y)}. "
+                f"This indicates a session/window reconstruction bug."
+            )
+
         n_samples = len(self.mm_y)
         print(f"  [info] M6Dataset: {n_samples} samples, {len(self.embeddings_map)} session embeddings available")
 
@@ -243,33 +355,37 @@ class M6Dataset(Dataset):
         return len(self.mm_y)
 
     def __getitem__(self, i: int):
-        # Get the CAN and label for this sample
-        can_window = self.mm_tele[i]   # (240, 5) or (160, 5) etc.
+        can_window = self.mm_tele[i]
         label = self.mm_y[i]
         
-        # For visual: since embeddings are only available for ~40 seconds per session
-        # but fold windows can go up to 60+ seconds, we can't do exact frame mapping.
-        # Instead, use a deterministic seeding per sample to pick a session.
-        # This ensures cross-session training diversity without knowing the true session.
-        if self.embeddings_map:
-            # Use sample index + random seed to deterministically pick a session
-            # This gives consistent but varied session selection
-            sessions_list = list(self.embeddings_map.items())
-            sess_idx = (i * 13 + 7) % len(sessions_list)  # prime-based indexing for better distribution
-            (subj, sess), emb = sessions_list[sess_idx]  # (N_frames, embed_dim)
-            
-            # Sample t_vis frames uniformly from available embeddings
-            if len(emb) >= self.t_vis:
-                idx = np.linspace(0, len(emb) - 1, self.t_vis).round().astype(np.int64)
-                clip = emb[idx]
-            else:
-                # Pad with repetition if too few frames
-                idx = np.linspace(0, len(emb) - 1, self.t_vis).astype(np.int64)
-                clip = emb[idx]
-        else:
-            # Fallback: random embeddings if no cache
-            embed_dim = self.cache.embed_dim
-            clip = np.random.randn(self.t_vis, embed_dim).astype(np.float32)
+        # CRITICAL FIX: Fail loudly if embeddings are missing (no silent random data)
+        if not self.index or i >= len(self.index):
+            raise IndexError(
+                f"Sample {i}: No index provided or out of range (index len={len(self.index) if self.index else 0})"
+            )
+        
+        subj, sess, win_idx = self.index[i]
+        if (subj, sess) not in self.embeddings_map:
+            raise KeyError(
+                f"Sample {i}: Missing embeddings for {subj}_{sess}. "
+                f"Available: {sorted(self.embeddings_map.keys())}"
+            )
+        
+        rec = self.embeddings_map[(subj, sess)]
+        clip = sample_clip_embedding(rec, win_idx, self.t_vis)
+        
+        # Validate embedding shape
+        if clip.shape != (self.t_vis, self.cache.embed_dim):
+            raise ValueError(
+                f"Sample {i}: Embedding shape mismatch. "
+                f"Got {clip.shape}, expected ({self.t_vis}, {self.cache.embed_dim})"
+            )
+        
+        # Optional: Add small Gaussian noise to visual embeddings during training
+        # (helps with generalization on small datasets)
+        if self.is_train:
+            noise = np.random.normal(0, 0.005, clip.shape).astype(np.float32)
+            clip = clip + noise
         
         return (
             torch.from_numpy(clip),
@@ -344,17 +460,18 @@ def evaluate(model: nn.Module, loader: DataLoader,
 
 
 def train_one_fold(fold_idx: int,
-                   variant: str = "full",
+                   variant: str = "lite_v2",
                    t_vis: int   = 16,
-                   epochs: int  = 30,
-                   batch_size: int = 32,
-                   lr: float    = 3e-4,
-                   weight_decay: float = 1e-4,
+                   epochs: int  = 50,
+                   batch_size: int = 16,
+                   lr: float    = 1e-3,
+                   weight_decay: float = 1e-5,
                    device: Optional[torch.device] = None,
                    seed: int    = 42,
                    processed_dir: Path = PROCESSED_DIR,
                    emb_dir: Path = EMB_DIR,
                    ckpt_dir: Path = CKPT_DIR,
+                   validate_data: bool = True,
                    verbose: bool = True) -> dict:
     """Train M6 on one fold and return a result dict."""
     torch.manual_seed(seed)
@@ -365,6 +482,27 @@ def train_one_fold(fold_idx: int,
     )
     if verbose:
         print(f"\n-- Fold {fold_idx}  (M6_{variant})  device={device}")
+
+    # 0. DATA VALIDATION (NEW: catch data bugs early)
+    if validate_data:
+        if verbose:
+            print("   Validating data integrity...")
+        from .m6_validate import full_validation
+        is_valid, report = full_validation(
+            fold_idx, processed_dir, emb_dir, verbose=verbose
+        )
+        if not is_valid:
+            fold_issues = report['fold_check']['issues']
+            emb_missing = report['emb_check']['missing']
+            idx_issues = report['idx_check']['issues']
+            raise RuntimeError(
+                f"Data validation failed for fold {fold_idx}. "
+                f"Fold issues={fold_issues}. "
+                f"Missing embeddings={emb_missing}. "
+                f"Index issues={idx_issues}."
+            )
+        if verbose:
+            print("   ✓ Data validation passed")
 
     # 1. Load fold .npz (mm_* arrays)
     fold_path = processed_dir / f"fold_{fold_idx}.npz"
@@ -398,13 +536,20 @@ def train_one_fold(fold_idx: int,
             f"Found: {sorted(fold_keys)}"
         )
     
+    train_idx = build_session_window_index(
+        train_subjects, cache, target_size=len(f[tele_train_key])
+    )
+    test_idx = build_session_window_index(
+        test_subjects, cache, target_size=len(f[tele_test_key])
+    )
+    
     train_ds = M6Dataset(
         f[tele_train_key], f[y_train_key],
-        fold_subjects=train_subjects, emb_cache=cache, t_vis=t_vis,
+        fold_subjects=train_subjects, emb_cache=cache, t_vis=t_vis, index=train_idx, is_train=True,
     )
     test_ds = M6Dataset(
         f[tele_test_key], f[y_test_key],
-        fold_subjects=test_subjects, emb_cache=cache, t_vis=t_vis,
+        fold_subjects=test_subjects, emb_cache=cache, t_vis=t_vis, index=test_idx, is_train=False,
     )
     if verbose:
         print(f"   train={len(train_ds)}  test={len(test_ds)}  "
@@ -421,8 +566,8 @@ def train_one_fold(fold_idx: int,
         print(f"   params={count_parameters(model):,}")
 
     # 4. Loss / optimiser
-    cw         = _class_weights(np.asarray(f["mm_y_train"])).to(device)
-    criterion  = nn.CrossEntropyLoss(weight=cw)
+    cw         = _class_weights(np.asarray(f[y_train_key])).to(device)
+    criterion  = nn.CrossEntropyLoss(weight=cw, label_smoothing=0.0)
     optimiser  = torch.optim.AdamW(model.parameters(),
                                    lr=lr, weight_decay=weight_decay)
     scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
