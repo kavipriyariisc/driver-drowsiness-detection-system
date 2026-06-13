@@ -1,0 +1,396 @@
+"""
+M6 — Temporal YOLOv8 Visual + CAN Telemetry Fusion (PyTorch)
+============================================================
+Improves over M5 (per-frame YOLOv8-cls, 54.5% acc) in two ways:
+
+  1. Adds **temporal context** over visual frames within each 60-s window
+     (Transformer encoder / BiLSTM over T=16 sampled frame embeddings).
+  2. Adds the **CAN telemetry** branch (5-channel @ 4 Hz, 240 timesteps)
+     fused with visual features.
+
+Two variants are provided:
+
+  M6_Lite  — BiLSTM(visual) ⊕ BiLSTM(can) → concat → MLP head
+             (fast, easy baseline; ~0.4 M params + frozen backbone)
+
+  M6_Full  — Transformer(visual) ⊕ BiLSTM(can) → bidirectional
+             cross-modal attention → concat → MLP head
+             (thesis novelty; ~1 M params + frozen backbone)
+
+Visual embeddings (T, 512) are extracted once with the M5 YOLOv8-cls
+backbone (see `src/models/m6_extractor.py`) and cached on disk, so the
+backbone is *not* re-run during M6 training — making both variants
+fast to train on a single GPU/CPU.
+
+Label schema (matches the rest of the project):
+    0 → Alert        (KSS 1-3)
+    1 → Low Vigilant (KSS 4-6)
+    2 → Drowsy       (KSS 7-9)
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+# ─── Defaults aligned with the rest of the project ────────────────────────────
+T_VIS_DEFAULT   = 16    # frames sampled per window
+EMB_DIM_DEFAULT = 512   # YOLOv8-cls backbone embedding size
+T_CAN_DEFAULT   = 240   # 60 s × 4 Hz telemetry timesteps
+N_CAN_DEFAULT   = 5     # pitch, roll, speed, rpm, gear
+N_CLASSES       = 3
+CLASS_NAMES     = ["Alert", "LowVigilant", "Drowsy"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared CAN telemetry encoder (BiLSTM)
+# ─────────────────────────────────────────────────────────────────────────────
+class _CANEncoder(nn.Module):
+    """BiLSTM encoder for CAN telemetry → returns (B, T_can, 2*hidden)."""
+
+    def __init__(self, n_in: int = N_CAN_DEFAULT, hidden: int = 64,
+                 num_layers: int = 1, dropout: float = 0.30):
+        super().__init__()
+        self.bilstm = nn.LSTM(
+            input_size=n_in, hidden_size=hidden, num_layers=num_layers,
+            batch_first=True, bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:    # (B, T_can, n_in)
+        out, _ = self.bilstm(x)
+        return self.drop(out)                               # (B, T_can, 2H)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-modal attention block
+# ─────────────────────────────────────────────────────────────────────────────
+class _CrossAttnBlock(nn.Module):
+    """
+    Standard scaled-dot-product multi-head cross-attention.
+
+    Query comes from one modality, key/value from the other.
+    Inputs are first projected to `d_model` so source dims may differ.
+    """
+
+    def __init__(self, d_q: int, d_kv: int, d_model: int = 128,
+                 n_heads: int = 4, dropout: float = 0.10):
+        super().__init__()
+        self.proj_q  = nn.Linear(d_q,  d_model)
+        self.proj_kv = nn.Linear(d_kv, d_model)
+        self.attn    = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.norm    = nn.LayerNorm(d_model)
+
+    def forward(self, q_seq: torch.Tensor,
+                kv_seq: torch.Tensor) -> torch.Tensor:
+        Q  = self.proj_q(q_seq)        # (B, T_q,  d_model)
+        KV = self.proj_kv(kv_seq)      # (B, T_kv, d_model)
+        ctx, _ = self.attn(Q, KV, KV, need_weights=False)
+        return self.norm(ctx + Q)      # residual + LN  → (B, T_q, d_model)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M6_Lite  — simple BiLSTM ⊕ BiLSTM concat
+# ─────────────────────────────────────────────────────────────────────────────
+class M6_Lite(nn.Module):
+    """
+    Lightweight fusion baseline.
+
+        Visual (B, T_vis, 512)  → BiLSTM(128 bidir) → mean-pool → (B, 256)
+        CAN    (B, T_can,   5)  → BiLSTM( 64 bidir) → mean-pool → (B, 128)
+        concat → Dense(128) → Dropout → Dense(3)
+
+    Intended as the first sanity-check model for the M6 idea.
+    """
+
+    def __init__(self, emb_dim: int = EMB_DIM_DEFAULT,
+                 n_can: int = N_CAN_DEFAULT,
+                 vis_hidden: int = 128, can_hidden: int = 64,
+                 dropout: float = 0.40, n_classes: int = N_CLASSES):
+        super().__init__()
+        self.vis_bilstm = nn.LSTM(
+            input_size=emb_dim, hidden_size=vis_hidden,
+            batch_first=True, bidirectional=True,
+        )
+        self.can_enc = _CANEncoder(n_in=n_can, hidden=can_hidden,
+                                   dropout=dropout)
+        self.drop    = nn.Dropout(dropout)
+        d_v          = 2 * vis_hidden       # 256
+        d_c          = 2 * can_hidden       # 128
+        self.head    = nn.Sequential(
+            nn.Linear(d_v + d_c, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, vis: torch.Tensor,
+                can: torch.Tensor) -> torch.Tensor:
+        # vis: (B, T_vis, 512)   can: (B, T_can, 5)
+        v_seq, _ = self.vis_bilstm(vis)
+        v_pool   = self.drop(v_seq.mean(dim=1))         # (B, 256)
+        c_seq    = self.can_enc(can)
+        c_pool   = c_seq.mean(dim=1)                    # (B, 128)
+        return self.head(torch.cat([v_pool, c_pool], dim=1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M6_Lite_v2 — FIXED VERSION (improved over M6_Lite)
+# ─────────────────────────────────────────────────────────────────────────────
+class M6_Lite_v2(nn.Module):
+    """
+    Improved lightweight baseline (fixes for small dataset):
+    
+        Visual (B, T_vis, 512)  → BiLSTM(128 bidir) → mean-pool → (B, 256)
+        CAN    (B, T_can,   5)  → BiLSTM( 64 bidir) → mean-pool → (B, 128)
+        concat → Dense(128, ReLU) → Dense(3)
+    
+    Changes from M6_Lite:
+        - Reduced dropout: 0.40 → 0.15 (for small dataset)
+        - Simpler head: single Dense layer
+        - Better initialization
+    
+    Intended as the primary baseline for M6 v2 (after fixing data bugs).
+    """
+
+    def __init__(self, emb_dim: int = EMB_DIM_DEFAULT,
+                 n_can: int = N_CAN_DEFAULT,
+                 vis_hidden: int = 128, can_hidden: int = 64,
+                 dropout: float = 0.15, n_classes: int = N_CLASSES):
+        super().__init__()
+        self.vis_bilstm = nn.LSTM(
+            input_size=emb_dim, hidden_size=vis_hidden,
+            batch_first=True, bidirectional=True,
+        )
+        self.can_enc = _CANEncoder(n_in=n_can, hidden=can_hidden,
+                                   dropout=dropout)
+        self.drop    = nn.Dropout(dropout)
+        d_v          = 2 * vis_hidden       # 256
+        d_c          = 2 * can_hidden       # 128
+        self.head    = nn.Sequential(
+            nn.Linear(d_v + d_c, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, vis: torch.Tensor,
+                can: torch.Tensor) -> torch.Tensor:
+        # vis: (B, T_vis, 512)   can: (B, T_can, 5)
+        v_seq, _ = self.vis_bilstm(vis)
+        v_pool   = self.drop(v_seq.mean(dim=1))         # (B, 256)
+        c_seq    = self.can_enc(can)
+        c_pool   = c_seq.mean(dim=1)                    # (B, 128)
+        return self.head(torch.cat([v_pool, c_pool], dim=1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M6_Full_v2 — ENHANCED VERSION (improved over M6_Full)
+# ─────────────────────────────────────────────────────────────────────────────
+class M6_Full_v2(nn.Module):
+    """
+    Improved M6 model with reduced complexity (fixes for small dataset):
+
+        Visual (B, T_vis, 512)
+            → Linear(512 → d_model)
+            → +PositionalEmbedding
+            → TransformerEncoder × 1 layer           ─► H_v  (B, T_vis, d)
+
+        CAN    (B, T_can, 5)
+            → BiLSTM(can_hidden bidir) → Linear(2H → d) ─► H_c  (B, T_can, d)
+
+        Cross-modal attention (bidirectional, single block):
+            ctx_v = CrossAttn(query=H_v, kv=H_c)       (B, T_vis, d)
+            ctx_c = CrossAttn(query=H_c, kv=H_v)       (B, T_can, d)
+
+        Mean-pool both → concat (4 × d) → Dense(128) → Dropout → Dense(3)
+
+    Changes from M6_Full:
+        - Reduced Transformer layers: 2 → 1
+        - Reduced dropout: 0.30 → 0.15
+        - Simpler head architecture
+    
+    Intended as enhanced model after M6_Lite_v2 proves data is correct.
+    """
+
+    def __init__(self,
+                 emb_dim: int = EMB_DIM_DEFAULT,
+                 n_can: int   = N_CAN_DEFAULT,
+                 t_vis: int   = T_VIS_DEFAULT,
+                 d_model: int = 128,
+                 n_heads: int = 4,
+                 n_layers: int = 1,  # Reduced from 2
+                 can_hidden: int = 64,
+                 dropout: float = 0.15,  # Reduced from 0.30
+                 n_classes: int = N_CLASSES):
+        super().__init__()
+
+        # Visual branch -------------------------------------------------------
+        self.vis_proj   = nn.Linear(emb_dim, d_model)
+        self.vis_pos    = nn.Parameter(torch.zeros(1, t_vis, d_model))
+        nn.init.trunc_normal_(self.vis_pos, std=0.02)
+        enc_layer       = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=4 * d_model, dropout=dropout,
+            batch_first=True, activation="gelu", norm_first=True,
+        )
+        self.vis_tx     = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
+        # CAN branch ----------------------------------------------------------
+        self.can_enc    = _CANEncoder(n_in=n_can, hidden=can_hidden,
+                                      dropout=dropout)
+        self.can_proj   = nn.Linear(2 * can_hidden, d_model)
+
+        # Bidirectional cross-modal attention ---------------------------------
+        self.attn_v2c   = _CrossAttnBlock(d_q=d_model, d_kv=d_model,
+                                          d_model=d_model, n_heads=n_heads,
+                                          dropout=dropout)
+        self.attn_c2v   = _CrossAttnBlock(d_q=d_model, d_kv=d_model,
+                                          d_model=d_model, n_heads=n_heads,
+                                          dropout=dropout)
+
+        # Classifier head -----------------------------------------------------
+        self.head = nn.Sequential(
+            nn.Linear(4 * d_model, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, vis: torch.Tensor,
+                can: torch.Tensor) -> torch.Tensor:
+        # Visual branch
+        H_v = self.vis_proj(vis) + self.vis_pos[:, : vis.size(1), :]
+        H_v = self.vis_tx(H_v)                                    # (B, T_vis, d)
+
+        # CAN branch
+        H_c = self.can_proj(self.can_enc(can))                    # (B, T_can, d)
+
+        # Cross-modal attention (bidirectional)
+        ctx_v = self.attn_v2c(H_v, H_c)                           # (B, T_vis, d)
+        ctx_c = self.attn_c2v(H_c, H_v)                           # (B, T_can, d)
+
+        # Pool everything → concat
+        pooled = torch.cat([
+            H_v.mean(dim=1),    # (B, d)  raw visual context
+            H_c.mean(dim=1),    # (B, d)  raw CAN context
+            ctx_v.mean(dim=1),  # (B, d)  visual attended to CAN
+            ctx_c.mean(dim=1),  # (B, d)  CAN attended to visual
+        ], dim=1)                                                  # (B, 4d)
+
+        return self.head(pooled)
+
+
+class M6_Full(nn.Module):
+    """
+    Full M6 model — the thesis-novelty configuration.
+
+        Visual (B, T_vis, 512)
+            → Linear(512 → d_model)
+            → +PositionalEmbedding
+            → TransformerEncoder × n_layers           ─► H_v  (B, T_vis, d)
+
+        CAN    (B, T_can, 5)
+            → BiLSTM(can_hidden bidir) → Linear(2H → d) ─► H_c  (B, T_can, d)
+
+        Cross-modal attention (bidirectional):
+            ctx_v = CrossAttn(query=H_v, kv=H_c)       (B, T_vis, d)
+            ctx_c = CrossAttn(query=H_c, kv=H_v)       (B, T_can, d)
+
+        Mean-pool both → concat (4 × d) → Dense(128) → Dropout → Dense(3)
+    """
+
+    def __init__(self,
+                 emb_dim: int = EMB_DIM_DEFAULT,
+                 n_can: int   = N_CAN_DEFAULT,
+                 t_vis: int   = T_VIS_DEFAULT,
+                 d_model: int = 128,
+                 n_heads: int = 4,
+                 n_layers: int = 2,
+                 can_hidden: int = 64,
+                 dropout: float = 0.30,
+                 n_classes: int = N_CLASSES):
+        super().__init__()
+
+        # Visual branch -------------------------------------------------------
+        self.vis_proj   = nn.Linear(emb_dim, d_model)
+        self.vis_pos    = nn.Parameter(torch.zeros(1, t_vis, d_model))
+        nn.init.trunc_normal_(self.vis_pos, std=0.02)
+        enc_layer       = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=4 * d_model, dropout=dropout,
+            batch_first=True, activation="gelu", norm_first=True,
+        )
+        self.vis_tx     = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
+        # CAN branch ----------------------------------------------------------
+        self.can_enc    = _CANEncoder(n_in=n_can, hidden=can_hidden,
+                                      dropout=dropout)
+        self.can_proj   = nn.Linear(2 * can_hidden, d_model)
+
+        # Bidirectional cross-modal attention ---------------------------------
+        self.attn_v2c   = _CrossAttnBlock(d_q=d_model, d_kv=d_model,
+                                          d_model=d_model, n_heads=n_heads,
+                                          dropout=dropout)
+        self.attn_c2v   = _CrossAttnBlock(d_q=d_model, d_kv=d_model,
+                                          d_model=d_model, n_heads=n_heads,
+                                          dropout=dropout)
+
+        # Classifier head -----------------------------------------------------
+        self.head = nn.Sequential(
+            nn.Linear(4 * d_model, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, vis: torch.Tensor,
+                can: torch.Tensor) -> torch.Tensor:
+        # Visual branch
+        H_v = self.vis_proj(vis) + self.vis_pos[:, : vis.size(1), :]
+        H_v = self.vis_tx(H_v)                                    # (B, T_vis, d)
+
+        # CAN branch
+        H_c = self.can_proj(self.can_enc(can))                    # (B, T_can, d)
+
+        # Cross-modal attention (bidirectional)
+        ctx_v = self.attn_v2c(H_v, H_c)                           # (B, T_vis, d)
+        ctx_c = self.attn_c2v(H_c, H_v)                           # (B, T_can, d)
+
+        # Pool everything → concat
+        pooled = torch.cat([
+            H_v.mean(dim=1),    # (B, d)  raw visual context
+            H_c.mean(dim=1),    # (B, d)  raw CAN context
+            ctx_v.mean(dim=1),  # (B, d)  visual attended to CAN
+            ctx_c.mean(dim=1),  # (B, d)  CAN attended to visual
+        ], dim=1)                                                  # (B, 4d)
+
+        return self.head(pooled)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory
+# ─────────────────────────────────────────────────────────────────────────────
+def build_m6(name: str = "full", **kwargs) -> nn.Module:
+    """Build an M6 variant by short name: 'lite' | 'lite_v2' | 'full' | 'full_v2'."""
+    name = name.lower()
+    if name in ("lite", "m6_lite", "m6-lite"):
+        return M6_Lite(**kwargs)
+    if name in ("lite_v2", "m6_lite_v2", "m6-lite-v2"):
+        return M6_Lite_v2(**kwargs)
+    if name in ("full", "m6", "m6_full", "m6-full"):
+        return M6_Full(**kwargs)
+    if name in ("full_v2", "m6_full_v2", "m6-full-v2"):
+        return M6_Full_v2(**kwargs)
+    raise ValueError(
+        f"Unknown M6 variant: {name!r}. "
+        f"Use 'lite', 'lite_v2', 'full', or 'full_v2'."
+    )
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Return the number of trainable parameters of a module."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)

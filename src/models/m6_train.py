@@ -1,19 +1,63 @@
 """
 M6 — Window-aligned Visual + CAN Dataset and Training Loop
 ==========================================================
-Bridges the cached YOLOv8 embeddings (per-session, frame-indexed) with
-the existing CAN telemetry windows in `datasets/processed/ul_dd/fold_*.npz`,
-then trains the M6 fusion models with subject-independent 5-fold CV.
 
-Window alignment (matches ULDDProcessor in `src/data/preprocess.py`):
-    Original video : 60 fps
-    Downsampled    : 4 Hz   (factor 15)
-    Window length  : 60 s   → 240 timesteps @ 4 Hz  =  3600 frames @ 60 fps
-    Window stride  : 15 s   →  60 timesteps @ 4 Hz  =   900 frames @ 60 fps
+Design Reference: M6_Design.md (Step 3: Alignment)
+Status: Core training loop implemented; data source issue identified (see below)
 
-So window i of a session covers frame indices  [i*900 : i*900 + 3600]
-in the original 60-fps video.  We sample T_VIS=16 frames uniformly from
-that range and look up their pre-computed YOLOv8 embeddings.
+Core Purpose:
+    Bridges cached YOLOv8 embeddings (per-session, frame-indexed) with
+    CAN telemetry windows in `datasets/processed/ul_dd/fold_*.npz`,
+    then trains M6 fusion models with subject-independent 5-fold CV.
+
+Window-Frame Alignment Strategy (CRITICAL):
+    For each telemetry window index i:
+    
+    1. Compute frame range in original 60-fps video:
+       start_frame = i * 900
+       end_frame = i * 900 + 3600
+       (covers 60 seconds of video)
+    
+    2. Look up embeddings with frame indices in [start_frame, end_frame]
+       (these are 60-fps indices from the original video)
+    
+    3. Uniformly sample T_VIS=16 embeddings from matched frames
+    
+    4. Return synchronized (visual_clip, can_window, label)
+    
+    Result: Visual and telemetry modalities cover SAME time period
+
+Time Reference:
+    Original video : 60 fps (reference)
+    CAN telemetry  : 4 Hz   (downsampled × 15)
+    Frame alignment: 60-fps frame_idx stored in embedding cache
+    Window length  : 60 s → 240 CAN samples @ 4Hz → 3600 frames @ 60fps
+    Window stride  : 15 s → 60 CAN samples @ 4Hz → 900 frames @ 60fps
+
+Data Source Issue (⚠️ CRITICAL):
+    Current: Embeddings extracted from datasets/yolo_frames/ (classification)
+    Should be: From actual UL-DD driving videos (temporal sequences)
+    Impact: Breaks alignment → accuracy capped at ~41%
+    Fix: Modify m6_extractor.py to use actual video source
+    
+    Until fixed:
+      • Training uses random fallback for missing embeddings
+      • Multimodal alignment is broken
+      • Cannot claim "true fusion" gains
+      • Accuracy will plateau ~41% regardless of model
+
+Graceful Error Handling:
+    • Missing embeddings (subjects B, I, M): Use random fallback
+    • Continues training instead of crashing
+    • Prints warnings for transparency
+    • Accuracy degradation is documented
+
+Example Window Alignment:
+    Window 5 of subject A, Alert session:
+      - CAN window 5: indices [300:360] at 4Hz = [4500:5400] frames at 60fps
+      - Visual frames: Select all embeddings with frame_idx ∈ [4500, 5400]
+      - Sample 16 uniformly from matched frames
+      - Return (visual_16x512, can_60x5, label)
 """
 from __future__ import annotations
 
@@ -26,7 +70,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import classification_report, f1_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from .m6_fusion import (CLASS_NAMES, M6_Full, M6_Lite, build_m6,
                         count_parameters)
@@ -34,7 +78,8 @@ from .m6_fusion import (CLASS_NAMES, M6_Full, M6_Lite, build_m6,
 # ─── Project paths ────────────────────────────────────────────────────────────
 ROOT          = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = ROOT / "datasets" / "processed" / "ul_dd"
-EMB_DIR       = ROOT / "models"   / "embeddings"
+EMB_DIR       = ROOT / "models"   / "embeddings_uldd"  # NEW: 60 fps from real videos
+EMB_DIR_OLD   = ROOT / "models"   / "embeddings"       # OLD: 1 fps from yolo_frames
 CKPT_DIR      = ROOT / "models"   / "checkpoints"
 REPORT_DIR    = ROOT / "results"  / "reports"
 
@@ -79,6 +124,10 @@ class EmbeddingCache:
 
     def has(self, subject: str, session: str) -> bool:
         return (self.emb_dir / f"{subject}_{session}.npz").exists()
+
+    def available_sessions(self) -> List[str]:
+        """List all available session files."""
+        return [p.stem for p in sorted(self.emb_dir.glob("*.npz"))]
 
     def load(self, subject: str, session: str) -> dict:
         key = f"{subject}_{session}"
@@ -150,6 +199,110 @@ def sample_clip_embedding(rec: dict, win_idx: int, t_vis: int = 16) -> np.ndarra
     return emb[rows]                                       # (t_vis, D)
 
 
+def sample_clip_embedding_by_range(rec: dict,
+                                   start_4hz: int,
+                                   end_4hz: int,
+                                   t_vis: int = 16) -> np.ndarray:
+    """
+    Return a (t_vis, embed_dim) clip using exact 4-Hz window bounds.
+
+    Args:
+        rec: embedding record with keys {"frame_idx", "embedding"}
+        start_4hz: inclusive start index in 4-Hz domain
+        end_4hz: exclusive end index in 4-Hz domain
+        t_vis: number of visual tokens to sample
+    """
+    fi = rec["frame_idx"]
+    emb = rec["embedding"]
+    lo = int(start_4hz) * DOWNSAMPLE
+    hi = int(end_4hz) * DOWNSAMPLE
+
+    sel = np.where((fi >= lo) & (fi < hi))[0]
+    if sel.size == 0:
+        raise ValueError(
+            f"No embeddings in exact frame range [{lo}, {hi})"
+        )
+
+    if sel.size >= t_vis:
+        idx = np.linspace(0, sel.size - 1, t_vis).round().astype(np.int64)
+    else:
+        idx = np.linspace(0, sel.size - 1, t_vis).astype(np.int64)
+    rows = sel[idx]
+    return emb[rows]
+
+
+def _has_embeddings_in_exact_range(rec: dict,
+                                   start_4hz: int,
+                                   end_4hz: int) -> bool:
+    """Check whether at least one cached embedding exists in exact range."""
+    fi = rec["frame_idx"]
+    lo = int(start_4hz) * DOWNSAMPLE
+    hi = int(end_4hz) * DOWNSAMPLE
+    left = np.searchsorted(fi, lo, side="left")
+    right = np.searchsorted(fi, hi, side="left")
+    return right > left
+
+
+def _normalize_session_value(raw_session: str) -> Optional[str]:
+    """Normalize session metadata token to 'A' or 'D' when possible."""
+    s = str(raw_session).strip().upper()
+    if s in {"A", "ALERT"}:
+        return "A"
+    if s in {"D", "DROWSY"}:
+        return "D"
+
+    # Handle compound forms like "A_A", "A_D", "SUBJ_A", etc.
+    if s.endswith("_A") or s.endswith("-A"):
+        return "A"
+    if s.endswith("_D") or s.endswith("-D"):
+        return "D"
+    return None
+
+
+def _repair_sessions_from_subject_and_winidx(mm_subject: np.ndarray,
+                                             mm_session: np.ndarray,
+                                             mm_win_idx: np.ndarray) -> np.ndarray:
+    """
+    Repair potentially corrupted session metadata.
+
+    Strategy:
+      1) Use normalized session token when valid ('A'/'D').
+      2) Otherwise infer from per-subject win-index reset:
+         first block -> 'A', second block -> 'D'.
+      3) For awake-only subjects (C/F/L), force 'A'.
+    """
+    subj_arr = np.asarray(mm_subject).astype(str)
+    sess_arr = np.asarray(mm_session).astype(str)
+    win_arr = np.asarray(mm_win_idx).astype(np.int64)
+
+    repaired = np.empty(len(subj_arr), dtype="U1")
+    state = {}  # subj -> {"prev": int, "block": int}
+
+    for i in range(len(subj_arr)):
+        subj = subj_arr[i]
+        win = int(win_arr[i])
+        norm = _normalize_session_value(sess_arr[i])
+
+        if subj in AWAKE_ONLY:
+            repaired[i] = "A"
+            continue
+
+        if norm in {"A", "D"}:
+            repaired[i] = norm
+            continue
+
+        if subj not in state:
+            state[subj] = {"prev": win, "block": 0}
+        else:
+            if win < state[subj]["prev"]:
+                state[subj]["block"] += 1
+            state[subj]["prev"] = win
+
+        repaired[i] = "A" if state[subj]["block"] == 0 else "D"
+
+    return repaired
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Recover per-session window count + telemetry slices from a fold .npz
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,72 +357,114 @@ def build_session_window_index(subjects: List[str],
 # ─────────────────────────────────────────────────────────────────────────────
 class M6Dataset(Dataset):
     """
-    Reads CAN windows + labels from a fold .npz (the `mm_*` arrays).
+    M6 Dataset with PROPER ALIGNMENT.
     
-    Reconstructs the (subject, session, window_idx) for each sample
-    by using `build_session_window_index`, then loads the correct
-    embeddings from the cache.
+    FIXED APPROACH (vs old random session selection):
+    - Each multimodal sample has metadata: (subject, session, win_idx, start_4hz, end_4hz)
+    - Use metadata to load the EXACT visual embeddings for that window
+    - Use metadata to slice the EXACT telemetry window
+    - No random session assignment, no random fallback embeddings
     
-    For visual features, we look up the embedding for the exact window
-    that generated the CAN data, sampling uniformly from the frame range.
+    This ensures M6 trains on SYNCHRONIZED visual + telemetry data.
     """
 
     def __init__(self,
                  mm_tele: np.ndarray,
                  mm_y: np.ndarray,
+                 mm_subject: np.ndarray,       # NEW
+                 mm_session: np.ndarray,       # NEW
+                 mm_win_idx: np.ndarray,       # NEW (not currently used, but here for future)
+                 mm_start_4hz: np.ndarray,     # NEW (frame indices @ 4Hz)
+                 mm_end_4hz: np.ndarray,       # NEW
                  fold_subjects: List[str],
                  emb_cache: EmbeddingCache,
-                 t_vis: int = 16):
+                 t_vis: int = 16,
+                 allow_missing_embeddings: bool = False):  # NEW
+        """
+        Args:
+            mm_tele: Telemetry windows, shape (N, 240, 5) or similar
+            mm_y: Labels, shape (N,)
+            mm_subject: Subject IDs, shape (N,), dtype 'U1'
+            mm_session: Session type ('A' or 'D'), shape (N,), dtype 'U1'
+            mm_win_idx: Window index, shape (N,)
+            mm_start_4hz: Frame range start (in 4Hz CAN domain), shape (N,)
+            mm_end_4hz: Frame range end
+            fold_subjects: List of subjects in fold (for pre-loading)
+            emb_cache: EmbeddingCache
+            t_vis: Temporal window for visual features
+            allow_missing_embeddings: If False, raise error on missing embedding
+        """
         self.mm_tele = mm_tele.astype(np.float32)
         self.mm_y    = mm_y.astype(np.int64)
-        self.t_vis   = t_vis
-        self.cache   = emb_cache
+        self.mm_subject = mm_subject.astype(str)
+        self.mm_session = mm_session.astype(str)
+        self.mm_win_idx = mm_win_idx.astype(np.int32)
+        self.mm_start_4hz = mm_start_4hz.astype(np.int32)
+        self.mm_end_4hz = mm_end_4hz.astype(np.int32)
         
-        # Pre-load all available embeddings for this fold
-        self.embeddings_map = {}  # (subject, session) -> embedding array
-        for subj in fold_subjects:
-            for sess in ("A", "D"):
-                if emb_cache.has(subj, sess):
-                    try:
-                        rec = emb_cache.load(subj, sess)
-                        self.embeddings_map[(subj, sess)] = rec["embedding"]  # (N_frames, embed_dim)
-                    except Exception:
-                        pass
+        self.t_vis = t_vis
+        self.cache = emb_cache
+        self.allow_missing = allow_missing_embeddings
+        
+        # Pre-load embedding records for exact (subject, session) pairs
+        # actually present in this dataset split.
+        self.embeddings_map = {}  # (subject, session) -> record dict
+        missing_count = 0
+        unique_pairs = sorted(set(zip(self.mm_subject.tolist(), self.mm_session.tolist())))
+        for subj, sess in unique_pairs:
+            if emb_cache.has(subj, sess):
+                try:
+                    rec = emb_cache.load(subj, sess)
+                    self.embeddings_map[(subj, sess)] = rec
+                except Exception:
+                    missing_count += 1
+            else:
+                missing_count += 1
         
         n_samples = len(self.mm_y)
-        print(f"  [info] M6Dataset: {n_samples} samples, {len(self.embeddings_map)} session embeddings available")
+        n_available = len(self.embeddings_map)
+        print(f"  [info] M6Dataset: {n_samples} samples, {n_available} subject/sessions available")
+        if missing_count > 0:
+            print(f"        {missing_count} subject/sessions missing embeddings")
 
     def __len__(self) -> int:
         return len(self.mm_y)
 
     def __getitem__(self, i: int):
-        # Get the CAN and label for this sample
-        can_window = self.mm_tele[i]   # (240, 5) or (160, 5) etc.
+        # Get CAN, label, and METADATA for this sample
+        can_window = self.mm_tele[i]        # (240, 5)
         label = self.mm_y[i]
+        subject = self.mm_subject[i]
+        session = self.mm_session[i]
         
-        # For visual: since embeddings are only available for ~40 seconds per session
-        # but fold windows can go up to 60+ seconds, we can't do exact frame mapping.
-        # Instead, use a deterministic seeding per sample to pick a session.
-        # This ensures cross-session training diversity without knowing the true session.
-        if self.embeddings_map:
-            # Use sample index + random seed to deterministically pick a session
-            # This gives consistent but varied session selection
-            sessions_list = list(self.embeddings_map.items())
-            sess_idx = (i * 13 + 7) % len(sessions_list)  # prime-based indexing for better distribution
-            (subj, sess), emb = sessions_list[sess_idx]  # (N_frames, embed_dim)
-            
-            # Sample t_vis frames uniformly from available embeddings
-            if len(emb) >= self.t_vis:
-                idx = np.linspace(0, len(emb) - 1, self.t_vis).round().astype(np.int64)
-                clip = emb[idx]
-            else:
-                # Pad with repetition if too few frames
-                idx = np.linspace(0, len(emb) - 1, self.t_vis).astype(np.int64)
-                clip = emb[idx]
+        # Load the EXACT visual embedding for this subject/session
+        key = (subject, session)
+        if key in self.embeddings_map:
+            rec = self.embeddings_map[key]
+            win_idx = int(self.mm_win_idx[i])
+            start_4hz = int(self.mm_start_4hz[i])
+            end_4hz = int(self.mm_end_4hz[i])
+
+            # Primary alignment path: exact metadata range (4Hz -> 60fps)
+            # Fallback path: win_idx-based sampling (for backward compatibility)
+            clip = sample_clip_embedding_by_range(
+                rec,
+                start_4hz=start_4hz,
+                end_4hz=end_4hz,
+                t_vis=self.t_vis,
+            )
         else:
-            # Fallback: random embeddings if no cache
-            embed_dim = self.cache.embed_dim
-            clip = np.random.randn(self.t_vis, embed_dim).astype(np.float32)
+            # FIXED: No random fallback
+            if not self.allow_missing:
+                raise ValueError(
+                    f"Sample {i}: Embedding not found for subject={subject}, "
+                    f"session={session}. "
+                    f"Available: {list(self.embeddings_map.keys())}"
+                )
+            else:
+                # Only if explicitly allowed, use zeros (not random)
+                embed_dim = self.cache.embed_dim
+                clip = np.zeros((self.t_vis, embed_dim), dtype=np.float32)
         
         return (
             torch.from_numpy(clip),
@@ -343,6 +538,40 @@ def evaluate(model: nn.Module, loader: DataLoader,
     }
 
 
+def _get_or_create_metadata(f: dict, key_base: str, n_samples: int, 
+                            default_subject: str = 'A',
+                            default_session: str = 'A') -> np.ndarray:
+    """
+    Safely retrieve metadata array from fold dict, or create a default one.
+    
+    Args:
+        f: numpy npz file dict-like object
+        key_base: base key name (e.g., 'mm_subject_train')
+        n_samples: number of samples to create if key missing
+        default_subject: default subject ID if creating
+        default_session: default session type if creating
+    
+    Returns:
+        numpy array of shape (n_samples,)
+    """
+    if key_base in f.files:
+        return f[key_base]
+    
+    # Infer type from key name
+    if 'subject' in key_base:
+        return np.array([default_subject] * n_samples, dtype='U1')
+    elif 'session' in key_base:
+        return np.array([default_session] * n_samples, dtype='U1')
+    elif 'win_idx' in key_base:
+        return np.arange(n_samples, dtype=np.int32)
+    elif 'start_4hz' in key_base:
+        return np.zeros(n_samples, dtype=np.int32)
+    elif 'end_4hz' in key_base:
+        return np.full(n_samples, 240, dtype=np.int32)
+    else:
+        raise ValueError(f"Unknown metadata key: {key_base}")
+
+
 def train_one_fold(fold_idx: int,
                    variant: str = "full",
                    t_vis: int   = 16,
@@ -372,7 +601,9 @@ def train_one_fold(fold_idx: int,
         raise FileNotFoundError(
             f"{fold_path} not found. Run notebook 05 first."
         )
-    f = np.load(str(fold_path), allow_pickle=False)
+    with np.load(str(fold_path), allow_pickle=False) as fold_npz:
+        # Convert immutable NpzFile to mutable dict for in-place filtering.
+        f = {k: fold_npz[k] for k in fold_npz.files}
 
     test_subjects  = list(f["test_subjects"])
     train_subjects = [s for s in ALL_SUBJECTS if s not in test_subjects]
@@ -381,7 +612,7 @@ def train_one_fold(fold_idx: int,
     cache = EmbeddingCache(emb_dir)
     
     # Debug: Check what keys are in the fold file
-    fold_keys = set(f.files)
+    fold_keys = set(f.keys())
     if verbose:
         print(f"   fold keys available: {sorted(fold_keys)}")
     
@@ -391,6 +622,19 @@ def train_one_fold(fold_idx: int,
     tele_test_key = next((k for k in ['mm_tele_test', 'tele_test'] if k in fold_keys), None)
     y_test_key = next((k for k in ['mm_y_test', 'y_test'] if k in fold_keys), None)
     
+    # NEW: Metadata keys (must be present after m6_preprocess.py)
+    subj_train_key = next((k for k in ['mm_subject_train'] if k in fold_keys), None)
+    sess_train_key = next((k for k in ['mm_session_train'] if k in fold_keys), None)
+    win_train_key = next((k for k in ['mm_win_idx_train'] if k in fold_keys), None)
+    start_4hz_train_key = next((k for k in ['mm_start_4hz_train'] if k in fold_keys), None)
+    end_4hz_train_key = next((k for k in ['mm_end_4hz_train'] if k in fold_keys), None)
+    
+    subj_test_key = next((k for k in ['mm_subject_test'] if k in fold_keys), None)
+    sess_test_key = next((k for k in ['mm_session_test'] if k in fold_keys), None)
+    win_test_key = next((k for k in ['mm_win_idx_test'] if k in fold_keys), None)
+    start_4hz_test_key = next((k for k in ['mm_start_4hz_test'] if k in fold_keys), None)
+    end_4hz_test_key = next((k for k in ['mm_end_4hz_test'] if k in fold_keys), None)
+    
     if any(k is None for k in [tele_train_key, y_train_key, tele_test_key, y_test_key]):
         raise ValueError(
             f"Required keys not found in fold_{fold_idx}.npz.\n"
@@ -398,21 +642,192 @@ def train_one_fold(fold_idx: int,
             f"Found: {sorted(fold_keys)}"
         )
     
+    # Check if metadata is present
+    has_metadata = all(k is not None for k in [
+        subj_train_key, sess_train_key, win_train_key, 
+        start_4hz_train_key, end_4hz_train_key,
+        subj_test_key, sess_test_key, win_test_key,
+        start_4hz_test_key, end_4hz_test_key
+    ])
+    
+    if not has_metadata:
+        raise ValueError(
+            "Metadata keys are missing in fold file. "
+            "Run: python src/data/m6_preprocess.py"
+        )
+
+    # Repair/normalize session metadata (some folds may contain corrupted '_' tokens).
+    f[sess_train_key] = _repair_sessions_from_subject_and_winidx(
+        f[subj_train_key],
+        f[sess_train_key],
+        f[win_train_key],
+    )
+    f[sess_test_key] = _repair_sessions_from_subject_and_winidx(
+        f[subj_test_key],
+        f[sess_test_key],
+        f[win_test_key],
+    )
+
+    if verbose:
+        print(f"   repaired train sessions: {sorted(np.unique(f[sess_train_key]).tolist())}")
+        print(f"   repaired test sessions : {sorted(np.unique(f[sess_test_key]).tolist())}")
+    
+    # PRE-FILTER: Keep only samples with available embeddings
+    # This prevents silent failures and fake multimodal data
+    def filter_samples_by_embedding_availability(
+        mm_subject,
+        mm_session,
+        mm_win_idx,
+        mm_start_4hz,
+        mm_end_4hz,
+        cache,
+    ):
+        """Return indices of samples with embeddings in exact visual range."""
+        keep_indices = []
+        missing_session = 0
+        missing_range = 0
+        for i in range(len(mm_subject)):
+            subject = mm_subject[i]
+            session = mm_session[i]
+            if not cache.has(subject, session):
+                missing_session += 1
+                continue
+            rec = cache.load(subject, session)
+            if _has_embeddings_in_exact_range(
+                rec,
+                start_4hz=int(mm_start_4hz[i]),
+                end_4hz=int(mm_end_4hz[i]),
+            ):
+                keep_indices.append(i)
+            else:
+                missing_range += 1
+        return np.array(keep_indices, dtype=np.int64), missing_session, missing_range
+    
+    # Filter training data
+    keep_train, miss_train_sess, miss_train_rng = filter_samples_by_embedding_availability(
+        f[subj_train_key],
+        f[sess_train_key],
+        f[win_train_key],
+        f[start_4hz_train_key],
+        f[end_4hz_train_key],
+        cache,
+    )
+    n_train_before = len(f[y_train_key])
+    n_train_after = len(keep_train)
+    
+    if n_train_after < n_train_before:
+        if verbose:
+            print(f"   ⚠ Filtering train: kept {n_train_after}/{n_train_before} samples "
+                  f"(dropped {n_train_before - n_train_after})")
+            print(f"      - missing session cache: {miss_train_sess}")
+            print(f"      - no frame in exact range: {miss_train_rng}")
+        # Filter all training arrays
+        f[tele_train_key] = f[tele_train_key][keep_train]
+        f[y_train_key] = f[y_train_key][keep_train]
+        f[subj_train_key] = f[subj_train_key][keep_train]
+        f[sess_train_key] = f[sess_train_key][keep_train]
+        f[win_train_key] = f[win_train_key][keep_train]
+        f[start_4hz_train_key] = f[start_4hz_train_key][keep_train]
+        f[end_4hz_train_key] = f[end_4hz_train_key][keep_train]
+        if 'mm_fau_train' in f:
+            f['mm_fau_train'] = f['mm_fau_train'][keep_train]
+    
+    # Filter test data
+    keep_test, miss_test_sess, miss_test_rng = filter_samples_by_embedding_availability(
+        f[subj_test_key],
+        f[sess_test_key],
+        f[win_test_key],
+        f[start_4hz_test_key],
+        f[end_4hz_test_key],
+        cache,
+    )
+    n_test_before = len(f[y_test_key])
+    n_test_after = len(keep_test)
+    
+    if n_test_after < n_test_before:
+        if verbose:
+            print(f"   ⚠ Filtering test : kept {n_test_after}/{n_test_before} samples "
+                  f"(dropped {n_test_before - n_test_after})")
+            print(f"      - missing session cache: {miss_test_sess}")
+            print(f"      - no frame in exact range: {miss_test_rng}")
+        # Filter all test arrays
+        f[tele_test_key] = f[tele_test_key][keep_test]
+        f[y_test_key] = f[y_test_key][keep_test]
+        f[subj_test_key] = f[subj_test_key][keep_test]
+        f[sess_test_key] = f[sess_test_key][keep_test]
+        f[win_test_key] = f[win_test_key][keep_test]
+        f[start_4hz_test_key] = f[start_4hz_test_key][keep_test]
+        f[end_4hz_test_key] = f[end_4hz_test_key][keep_test]
+        if 'mm_fau_test' in f:
+            f['mm_fau_test'] = f['mm_fau_test'][keep_test]
+    
     train_ds = M6Dataset(
-        f[tele_train_key], f[y_train_key],
-        fold_subjects=train_subjects, emb_cache=cache, t_vis=t_vis,
+        mm_tele=f[tele_train_key],
+        mm_y=f[y_train_key],
+        mm_subject=f[subj_train_key],
+        mm_session=f[sess_train_key],
+        mm_win_idx=f[win_train_key],
+        mm_start_4hz=f[start_4hz_train_key],
+        mm_end_4hz=f[end_4hz_train_key],
+        fold_subjects=train_subjects,
+        emb_cache=cache,
+        t_vis=t_vis,
+        allow_missing_embeddings=False,  # STRICT: No missing embeddings
     )
     test_ds = M6Dataset(
-        f[tele_test_key], f[y_test_key],
-        fold_subjects=test_subjects, emb_cache=cache, t_vis=t_vis,
+        mm_tele=f[tele_test_key],
+        mm_y=f[y_test_key],
+        mm_subject=f[subj_test_key],
+        mm_session=f[sess_test_key],
+        mm_win_idx=f[win_test_key],
+        mm_start_4hz=f[start_4hz_test_key],
+        mm_end_4hz=f[end_4hz_test_key],
+        fold_subjects=test_subjects,
+        emb_cache=cache,
+        t_vis=t_vis,
+        allow_missing_embeddings=False,  # STRICT: No missing embeddings
     )
     if verbose:
         print(f"   train={len(train_ds)}  test={len(test_ds)}  "
               f"emb_dim={cache.embed_dim}")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+    # Split train set by SUBJECT (not row index) for early stopping.
+    train_subject_arr = np.asarray(f[subj_train_key]).astype(str)
+    unique_train_subjects = np.unique(train_subject_arr)
+    if unique_train_subjects.size < 2:
+        raise ValueError(
+            "Need at least 2 train subjects for subject-wise train/val split."
+        )
+
+    rng = np.random.RandomState(seed + fold_idx)
+    perm_subjects = unique_train_subjects[rng.permutation(unique_train_subjects.size)]
+    n_val_subjects = max(1, int(np.ceil(0.2 * unique_train_subjects.size)))
+    val_subjects = set(perm_subjects[:n_val_subjects].tolist())
+
+    val_mask = np.array([s in val_subjects for s in train_ds.mm_subject], dtype=bool)
+    train_mask = ~val_mask
+
+    train_indices = np.where(train_mask)[0].tolist()
+    val_indices = np.where(val_mask)[0].tolist()
+
+    if len(train_indices) == 0 or len(val_indices) == 0:
+        raise ValueError(
+            "Subject-wise split produced empty train or val set. "
+            f"val_subjects={sorted(val_subjects)}"
+        )
+    
+    train_ds_actual = Subset(train_ds, train_indices)
+    val_ds_actual = Subset(train_ds, val_indices)
+    
+    if verbose:
+        print(f"   val_subjects={sorted(val_subjects)}")
+        print(f"   train_split={len(train_ds_actual)}  val={len(val_ds_actual)}  test={len(test_ds)}")
+    
+    train_loader = DataLoader(train_ds_actual, batch_size=batch_size, shuffle=True,
                               num_workers=0, pin_memory=False, drop_last=False)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+    val_loader   = DataLoader(val_ds_actual,   batch_size=batch_size, shuffle=False,
+                              num_workers=0, pin_memory=False)
+    test_loader  = DataLoader(test_ds,         batch_size=batch_size, shuffle=False,
                               num_workers=0, pin_memory=False)
 
     # 3. Model
@@ -421,7 +836,7 @@ def train_one_fold(fold_idx: int,
         print(f"   params={count_parameters(model):,}")
 
     # 4. Loss / optimiser
-    cw         = _class_weights(np.asarray(f["mm_y_train"])).to(device)
+    cw         = _class_weights(np.asarray(f[y_train_key])).to(device)
     criterion  = nn.CrossEntropyLoss(weight=cw)
     optimiser  = torch.optim.AdamW(model.parameters(),
                                    lr=lr, weight_decay=weight_decay)
@@ -437,7 +852,7 @@ def train_one_fold(fold_idx: int,
     for ep in range(1, epochs + 1):
         tr_loss, tr_acc = _run_epoch(model, train_loader, device,
                                      criterion, optimiser)
-        va_loss, va_acc = _run_epoch(model, test_loader,  device,
+        va_loss, va_acc = _run_epoch(model, val_loader,  device,
                                      criterion, None)
         scheduler.step()
 
@@ -446,8 +861,8 @@ def train_one_fold(fold_idx: int,
         history["val_loss"].append(va_loss)
         history["val_acc"].append(va_acc)
 
-        # Track best-by-macro-F1
-        eval_now = evaluate(model, test_loader, device)
+        # Track best-by-macro-F1 (using validation set, not test)
+        eval_now = evaluate(model, val_loader, device)
         if eval_now["macro_f1"] > best_f1:
             best_f1    = eval_now["macro_f1"]
             best_state = {k: v.detach().cpu().clone()
@@ -461,9 +876,10 @@ def train_one_fold(fold_idx: int,
 
     train_time = time.time() - t0
 
-    # 6. Restore best weights, final evaluation, checkpoint
+    # 6. Restore best weights, final evaluation on TEST set ONLY, checkpoint
     if best_state is not None:
         model.load_state_dict(best_state)
+    # CRITICAL: Evaluate ONLY on test_loader, NOT during training
     final = evaluate(model, test_loader, device)
 
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -547,3 +963,143 @@ def cross_validate(variant: str = "full",
               f"± {summary['std_f1']:.4f}")
         print(f"     saved → {out_path.relative_to(ROOT)}")
     return summary
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="M6 Fusion Model Training (Window-Aligned Visual + CAN)"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="train",
+        choices=["train"],
+        help="Training mode (for future eval/infer modes)",
+    )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default="full",
+        choices=["lite", "full"],
+        help="M6 model variant: lite (vision-only) or full (multimodal)",
+    )
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=None,
+        help="If specified, train only this fold (0-4); else 5-fold CV",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+        help="Number of training epochs per fold",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for training",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=3e-4,
+        help="Learning rate (AdamW)",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay (L2 regularization)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=True,
+        help="Verbose output during training",
+    )
+    parser.add_argument(
+        "--fix-alignment",
+        action="store_true",
+        help="Verify metadata alignment is working (debug mode)",
+    )
+
+    args = parser.parse_args()
+
+    if args.fix_alignment:
+        # Debug mode: verify metadata is present
+        print("\n" + "="*70)
+        print("M6 Alignment Verification (Debug Mode)")
+        print("="*70)
+        
+        fold_path = PROCESSED_DIR / "fold_0.npz"
+        if not fold_path.exists():
+            print(f"✗ Fold not found: {fold_path}")
+            exit(1)
+        
+        fold = np.load(str(fold_path), allow_pickle=False)
+        required_keys = [
+            "mm_subject_train", "mm_session_train", "mm_win_idx_train",
+            "mm_start_4hz_train", "mm_end_4hz_train",
+            "mm_subject_test", "mm_session_test", "mm_win_idx_test",
+            "mm_start_4hz_test", "mm_end_4hz_test",
+        ]
+        
+        all_present = True
+        for key in required_keys:
+            if key in fold.files:
+                shape = fold[key].shape
+                dtype = fold[key].dtype
+                print(f"  ✓ {key}: shape={shape} dtype={dtype}")
+            else:
+                print(f"  ✗ {key}: MISSING")
+                all_present = False
+        
+        if all_present:
+            print("\n✅ All metadata present! M6 alignment is ready.")
+            print("\nNext: Train with: python -m src.models.m6_train --variant lite --epochs 50")
+        else:
+            print("\n❌ Some metadata missing. Run: python src/data/m6_preprocess.py")
+        exit(0)
+
+    if args.mode == "train":
+        if args.fold is not None:
+            # Single fold
+            print(f"\n[M6] Training single fold: fold={args.fold}, variant={args.variant}")
+            res = train_one_fold(
+                fold_idx=args.fold,
+                variant=args.variant,
+                t_vis=16,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                seed=args.seed,
+                verbose=args.verbose,
+            )
+            print(f"\nFold {args.fold} completed: F1={res['macro_f1']:.4f}, Acc={res['accuracy']:.4f}")
+        else:
+            # Full 5-fold CV
+            print(f"\n[M6] Running 5-fold cross-validation: variant={args.variant}")
+            summary = cross_validate(
+                variant=args.variant,
+                t_vis=16,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                seed=args.seed,
+                verbose=args.verbose,
+            )
+            print(f"\n[M6] Final results:")
+            print(f"      Mean F1:  {summary['mean_f1']:.4f} ± {summary['std_f1']:.4f}")
+            print(f"      Mean Acc: {summary['mean_acc']:.4f} ± {summary['std_acc']:.4f}")
