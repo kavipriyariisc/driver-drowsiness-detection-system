@@ -1,31 +1,87 @@
 """
 M6 — Temporal YOLOv8 Visual + CAN Telemetry Fusion (PyTorch)
 ============================================================
-Improves over M5 (per-frame YOLOv8-cls, 54.5% acc) in two ways:
 
-  1. Adds **temporal context** over visual frames within each 60-s window
-     (Transformer encoder / BiLSTM over T=16 sampled frame embeddings).
-  2. Adds the **CAN telemetry** branch (5-channel @ 4 Hz, 240 timesteps)
-     fused with visual features.
+Design Reference: M6_Design.md
+Status: M6-C Fusion model implemented; M6-A baseline in m6_vision_only.py
 
-Two variants are provided:
+Improves over M5 (per-frame YOLOv8-cls, ~50-54% on frames) by:
 
-  M6_Lite  — BiLSTM(visual) ⊕ BiLSTM(can) → concat → MLP head
-             (fast, easy baseline; ~0.4 M params + frozen backbone)
+  1. **Temporal Modeling**: Encodes T=16 frames per 60-second window
+     through BiLSTM or Transformer to capture temporal dependencies
+     in driver behavior.
 
-  M6_Full  — Transformer(visual) ⊕ BiLSTM(can) → bidirectional
-             cross-modal attention → concat → MLP head
-             (thesis novelty; ~1 M params + frozen backbone)
+  2. **Multimodal Fusion**: Combines visual embeddings with 5-channel
+     CAN telemetry (pitch, roll, speed, RPM, gear) @ 4 Hz for 240 timesteps.
 
-Visual embeddings (T, 512) are extracted once with the M5 YOLOv8-cls
-backbone (see `src/models/m6_extractor.py`) and cached on disk, so the
-backbone is *not* re-run during M6 training — making both variants
-fast to train on a single GPU/CPU.
+  3. **Cross-Modal Attention** (M6_Full only): Bidirectional attention
+     allows visual and telemetry branches to inform each other.
 
-Label schema (matches the rest of the project):
+Window Alignment (Critical for fusion correctness):
+    For each telemetry window covering [start_sec, end_sec]:
+      • Window index: win_idx
+      • Frame range (60fps): [win_idx * 900, win_idx * 900 + 3600]
+      • Extract frames falling in this range
+      • Uniformly sample T_VIS=16 embeddings
+      • Align with CAN window covering same time period
+    → Only synchronized data should be fused
+
+Two Variants:
+
+  **M6_Lite** (M6 Baseline from Design)
+     BiLSTM(visual:128 bidir) → (B, 256)
+     ⊕
+     BiLSTM(CAN:64 bidir) → (B, 128)
+     ↓
+     concat + Dense(128) + ReLU + Dropout → Dense(3)
+     
+     Params: ~380K + frozen backbone
+     Training: Fast, easy baseline
+
+  **M6_Full** (M6-C Fusion from Design — Thesis Novelty)
+     Visual (B, T, 512):
+       → Linear(512→128) + PosPE
+       → Transformer(2 layers, 128-dim, 4 heads)
+       → H_v: (B, T, 128)
+     
+     CAN (B, 240, 5):
+       → BiLSTM(64 bidir)
+       → Linear(128→128)
+       → H_c: (B, 240, 128)
+     
+     Bidirectional Cross-Attention:
+       ctx_v = CrossAttn(query=H_v, kv=H_c)  # Visual attends to CAN
+       ctx_c = CrossAttn(query=H_c, kv=H_v)  # CAN attends to visual
+     
+     Fusion Head:
+       concat[H_v, H_c, ctx_v, ctx_c] → (B, 512)
+       → Dense(128) + ReLU + Dropout → Dense(3)
+     
+     Params: ~1M + frozen backbone
+     Training: ~5-10 min per fold (GPU)
+
+Visual Embeddings:
+    Source: M5 YOLOv8-cls backbone (512-dim, frozen)
+    Extraction: See src/models/m6_extractor.py
+    Cache: models/embeddings/{subject}_{session}.npz
+    
+    ⚠️  IMPORTANT: Embeddings must be extracted from ACTUAL UL-DD driving
+    videos, not from yolo_frames/ classification dataset. Current implementation
+    uses yolo_frames which breaks multimodal alignment → accuracy capped at ~41%.
+    
+    Fix: Modify m6_extractor.py to extract from UL-DD videos instead.
+
+Label Schema (matches M1/M2/M3/M5):
     0 → Alert        (KSS 1-3)
     1 → Low Vigilant (KSS 4-6)
     2 → Drowsy       (KSS 7-9)
+
+Expected Accuracy (with proper data alignment):
+    M6-A (Vision-only, no CAN):     ~50-60%
+    M6-Lite (Simple multimodal):    ~65-75%
+    M6-Full (Full fusion):          ~70-78%
+    
+    Current (wrong data source):    ~41% (alignment broken)
 """
 from __future__ import annotations
 
