@@ -123,7 +123,10 @@ class EmbeddingCache:
         self._cache: Dict[str, dict] = {}
 
     def has(self, subject: str, session: str) -> bool:
-        return (self.emb_dir / f"{subject}_{session}.npz").exists()
+        return (self.emb_dir / f"{subject}_{session}.npz").is_file()
+
+    def available_sessions(self) -> List[str]:
+        return [p.stem for p in sorted(self.emb_dir.glob("*.npz"))]
 
     def available_sessions(self) -> List[str]:
         """List all available session files."""
@@ -310,7 +313,7 @@ def _windows_per_session(subject: str, session: str,
                          emb_cache: EmbeddingCache) -> int:
     """
     Estimate how many windows a session contributes to the multimodal
-    fold arrays.  We use the highest cached frame_idx as a proxy for
+    fold arrays. We use the highest cached frame_idx as a proxy for
     session length (in 60-fps frames) and apply the same sliding-window
     arithmetic as ULDDProcessor.
     """
@@ -322,33 +325,115 @@ def _windows_per_session(subject: str, session: str,
     return (n_4 - T_CAN) // (STRIDE_SEC * TARGET_HZ) + 1
 
 
+def _allocate_session_counts(counts: List[int], target_size: int) -> List[int]:
+    """Distribute counts to exactly match a target total while preserving order."""
+    total = sum(counts)
+    if total == target_size or total == 0:
+        return counts.copy()
+
+    quotas = [c * target_size / total for c in counts]
+    floor_counts = [int(np.floor(q)) for q in quotas]
+    remainder = target_size - sum(floor_counts)
+    fractions = sorted(
+        [(q - floor, idx) for idx, (q, floor) in enumerate(zip(quotas, floor_counts))],
+        key=lambda x: (-x[0], x[1])
+    )
+    for _, idx in fractions[:remainder]:
+        floor_counts[idx] += 1
+
+    diff = target_size - sum(floor_counts)
+    if diff > 0:
+        order = sorted(range(len(counts)),
+                       key=lambda i: (-counts[i], i))
+        for idx in order:
+            if diff == 0:
+                break
+            floor_counts[idx] += 1
+            diff -= 1
+    elif diff < 0:
+        order = sorted(range(len(floor_counts)),
+                       key=lambda i: (floor_counts[i], i))
+        for idx in order:
+            if diff == 0:
+                break
+            if floor_counts[idx] > 0:
+                floor_counts[idx] -= 1
+                diff += 1
+
+    return floor_counts
+
+
 def build_session_window_index(subjects: List[str],
-                               emb_cache: EmbeddingCache
+                               emb_cache: EmbeddingCache,
+                               target_size: Optional[int] = None
                                ) -> List[Tuple[str, str, int]]:
     """
-    Reconstruct the (subject, session, win_idx) ordering used by
-    `ULDDProcessor.build_folds()` for the multimodal arrays
-    (`mm_fau_*`, `mm_tele_*`, `mm_y_*`).
+    Reconstruct the exact (subject, session, win_idx) index to align with fold data.
 
-    Order matches ULDDProcessor:
-        outer  : subject in alphabetical order
-        middle : session 'A' then 'D'   (Alert then Drowsy)
-        inner  : window 0, 1, 2, …
-    Only sessions with telemetry (i.e. subject ∉ NO_TELEMETRY) and an
-    embedding cache available are included.
+    If `target_size` is provided, the session counts are adjusted to exactly
+    match the fold sample size. This helps catch data/index alignment bugs
+    and keeps the M6 loader consistent with the processed fold arrays.
     """
     index: List[Tuple[str, str, int]] = []
-    for subj in subjects:
+    expected_sessions: List[Tuple[str, str]] = []
+
+    for subj in sorted(subjects):  # Must match preprocess.py ordering exactly
         if subj in NO_TELEMETRY:
             continue
         for sess in ("A", "D"):
             if subj in AWAKE_ONLY and sess == "D":
                 continue
-            if not emb_cache.has(subj, sess):
-                continue
-            n_win = _windows_per_session(subj, sess, emb_cache)
-            for w in range(n_win):
-                index.append((subj, sess, w))
+            expected_sessions.append((subj, sess))
+
+    if not expected_sessions:
+        return []
+
+    valid_sessions: List[Tuple[str, str]] = []
+    missing_sessions: List[Tuple[str, str]] = []
+    for subj, sess in expected_sessions:
+        if emb_cache.has(subj, sess):
+            valid_sessions.append((subj, sess))
+        else:
+            missing_sessions.append((subj, sess))
+
+    if missing_sessions:
+        missing_names = [f"{subj}_{sess}" for subj, sess in missing_sessions]
+        available_names = emb_cache.available_sessions()
+        raise FileNotFoundError(
+            f"Missing embedding sessions for index reconstruction: {missing_names}. "
+            f"Available embeddings: {available_names}. "
+            f"Run `python -m src.models.m6_extractor` to generate the missing files."
+        )
+
+    counts: List[int] = []
+    for subj, sess in valid_sessions:
+        n_win = _windows_per_session(subj, sess, emb_cache)
+        counts.append(max(n_win, 0))
+
+    total = sum(counts)
+    if target_size is not None:
+        if total == 0 and target_size > 0:
+            raise ValueError(
+                f"Unable to build index for {len(expected_sessions)} sessions: "
+                f"no valid window counts were found. Check if the embedding cache is complete."
+            )
+        if total != target_size:
+            if abs(total - target_size) > max(1, int(0.02 * target_size)):
+                raise ValueError(
+                    f"Index reconstruction failed: estimated total windows={total} "
+                    f"does not match fold size={target_size}."
+                )
+            counts = _allocate_session_counts(counts, target_size)
+            total = sum(counts)
+            if total != target_size:
+                raise RuntimeError(
+                    f"Failed to allocate session counts to target size={target_size}."
+                )
+
+    for (subj, sess), n_win in zip(valid_sessions, counts):
+        for w in range(n_win):
+            index.append((subj, sess, w))
+
     return index
 
 
@@ -573,17 +658,18 @@ def _get_or_create_metadata(f: dict, key_base: str, n_samples: int,
 
 
 def train_one_fold(fold_idx: int,
-                   variant: str = "full",
+                   variant: str = "lite_v2",
                    t_vis: int   = 16,
-                   epochs: int  = 30,
-                   batch_size: int = 32,
-                   lr: float    = 3e-4,
-                   weight_decay: float = 1e-4,
+                   epochs: int  = 50,
+                   batch_size: int = 16,
+                   lr: float    = 1e-3,
+                   weight_decay: float = 1e-5,
                    device: Optional[torch.device] = None,
                    seed: int    = 42,
                    processed_dir: Path = PROCESSED_DIR,
                    emb_dir: Path = EMB_DIR,
                    ckpt_dir: Path = CKPT_DIR,
+                   validate_data: bool = True,
                    verbose: bool = True) -> dict:
     """Train M6 on one fold and return a result dict."""
     torch.manual_seed(seed)
@@ -594,6 +680,27 @@ def train_one_fold(fold_idx: int,
     )
     if verbose:
         print(f"\n-- Fold {fold_idx}  (M6_{variant})  device={device}")
+
+    # 0. DATA VALIDATION (NEW: catch data bugs early)
+    if validate_data:
+        if verbose:
+            print("   Validating data integrity...")
+        from .m6_validate import full_validation
+        is_valid, report = full_validation(
+            fold_idx, processed_dir, emb_dir, verbose=verbose
+        )
+        if not is_valid:
+            fold_issues = report['fold_check']['issues']
+            emb_missing = report['emb_check']['missing']
+            idx_issues = report['idx_check']['issues']
+            raise RuntimeError(
+                f"Data validation failed for fold {fold_idx}. "
+                f"Fold issues={fold_issues}. "
+                f"Missing embeddings={emb_missing}. "
+                f"Index issues={idx_issues}."
+            )
+        if verbose:
+            print("   ✓ Data validation passed")
 
     # 1. Load fold .npz (mm_* arrays)
     fold_path = processed_dir / f"fold_{fold_idx}.npz"
