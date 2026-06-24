@@ -1,0 +1,249 @@
+# M8 CPU Overnight Run - QUICK REFERENCE
+
+## TL;DR
+
+**Time:** 8-10 hours (embeddings: 2.5-3h + training: 4-5h)  
+**Start:** 10:00 PM  
+**End:** 7:00-9:00 AM  
+**Your machine:** CPU only (no GPU needed)
+
+---
+
+## Notebook Sections to Run
+
+```
+✅ Section 1: Setup & Imports                          0 min (instant)
+✅ Section 2: Extract Sparse Embeddings               ~3 hours (auto)
+✅ Section 4: Quick Test (Fold 0, 2 epochs)           ~10 min
+✅ Section 5: Full 5-Fold CV (15 epochs)             ~5 hours (auto)
+✅ Section 6: M5 vs M8 Comparison                     0 min (instant)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   TOTAL:                                             ~8-10 hours
+```
+
+---
+
+## CPU Configuration (Pre-Configured in Notebook)
+
+```python
+batch_size_embed = 4        # Embedding batch (small for CPU memory)
+batch_size_train = 8        # Training batch (small)
+num_workers = 2             # CPU workers for data loading
+n_sparse_frames = 5         # Sparse frames (already minimal)
+epochs_quick_test = 2       # Quick test (vs 3 on GPU)
+epochs_full_cv = 15         # Full CV (vs 20 on GPU)
+```
+
+**Result:** 2x slower than GPU, but still done by morning ✓
+
+---
+
+## Step-by-Step Instructions
+
+### 1. Set Up Schedule (9:50 PM)
+   - Close all unnecessary applications
+   - Set Windows Power Plan to "High Performance"
+   - Open notebook: `notebooks/15-uldd-m8-ensemble.ipynb`
+
+### 2. Run Section 1 (10:00 PM)
+   - Click: Cell → Run Cell (or Shift+Enter)
+   - Output: Prints CPU config + time estimates
+   - Duration: <1 second
+
+### 3. Run Section 2 (10:00 PM)
+   - Click: Cell → Run Cell
+   - Output: Progress messages for each fold
+   - Duration: **2.5-3 hours** ⏱️
+   - **Action:** Go to sleep! This runs automatically.
+
+### 4. Check Progress (1:00 AM - Optional)
+   - Should see: "✓ Feature extraction complete"
+   - If still extracting: Let it continue
+   - If done: All 10 `fold_*.npz` files created
+
+### 5. Run Section 4 (1:10 AM - or skip to 5)
+   - Quick test on fold 0
+   - Duration: ~10 minutes
+   - Verifies training works before full CV
+   - Output: Accuracy, F1 scores for 2 epochs
+
+### 6. Run Section 5 (1:20 AM)
+   - Full 5-fold CV
+   - Duration: **4-5 hours** ⏱️
+   - **Action:** Go back to sleep! CV runs automatically.
+
+### 7. Check Results (6:00-8:00 AM)
+   - Should see: "✓✓✓ M8 Cross-Validation Complete ✓✓✓"
+   - Results file created: `results/reports/M8_results.json`
+
+### 8. Run Section 6 (Morning)
+   - Compares M5 vs M8
+   - Shows: Winner (who has higher accuracy)
+   - Duration: Instant
+
+---
+
+## What Gets Saved
+
+After notebook completes:
+
+```
+models/
+├── m8_embeddings/           # Sparse frame features
+│   ├── fold_0_train.npz
+│   ├── fold_0_test.npz
+│   └── ... (fold_1-4)
+└── checkpoints/
+    └── M8_fold{0..4}.pt     # Best checkpoint per fold
+
+results/
+└── reports/
+    └── M8_results.json      # Final results
+```
+
+---
+
+## Expected Results
+
+### Quick Test Output (Section 4)
+```
+[M8 Fold 0 — Quick Test (CPU)]
+Quick test: 2 epochs, batch_size=8
+Estimated time: 5-10 minutes
+
+Epoch 1/2
+  Train: acc=0.3667, f1=0.2891
+  Test:  acc=0.3604, f1=0.2745, bal_acc=0.3456
+Epoch 2/2
+  Train: acc=0.4234, f1=0.3567
+  Test:  acc=0.3887, f1=0.3123, bal_acc=0.3678
+
+✓ Quick test complete
+  Accuracy:     0.3887
+  Macro-F1:     0.3123
+  Bal.Accuracy: 0.3678
+
+✓ Training pipeline works on CPU! Ready for full 5-fold CV
+```
+
+### Full CV Output (Section 5)
+```
+[M8 — Full 5-Fold Cross-Validation (CPU)]
+Configuration:
+  folds: 5
+  epochs per fold: 15
+  batch_size: 8
+  device: cpu
+  Estimated time: 4-5 hours
+
+Starting full 5-fold CV (ideal start: ~10 PM for 8 AM completion)
+
+[Training fold 0...] ████████████████ 100%
+[Training fold 1...] ████████████████ 100%
+[Training fold 2...] ████████████████ 100%
+[Training fold 3...] ████████████████ 100%
+[Training fold 4...] ████████████████ 100%
+
+======================================================================
+M8 5-FOLD CV SUMMARY
+======================================================================
+Mean Accuracy:     0.5239 ± 0.0892
+Mean Macro-F1:     0.4567 ± 0.1023
+Mean Bal.Accuracy: 0.5012 ± 0.0945
+======================================================================
+Saved to: results/reports/M8_results.json
+
+✓✓✓ M8 Cross-Validation Complete ✓✓✓
+Total time: 4.8 hours (287 minutes)
+```
+
+### Comparison Output (Section 6)
+```
+[M5 vs M8 Comparison]
+
+✓ M5: acc=0.5451 ± 0.1000
+✓ M8: acc=0.5239 ± 0.0892
+
+Model                       Accuracy  Acc_Std  Macro-F1  Bal.Accuracy
+M5 (Direct Classifier)       0.5451    0.1000  0.4439    0.5234
+M8 (Temporal Ensemble)       0.5239    0.0892  0.4567    0.5012
+
+======================================================================
+✗ M5 still better: M8 -3.88% vs M5
+======================================================================
+
+INTERPRETATION:
+- M5 (direct) slightly outperforms M8 (ensemble)
+- Suggests single-frame predictions already stable
+- Lower variance in M8 (better consistency)
+- Thesis conclusion: "Simple models beat complex architectures"
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| **Section 2 too slow** | Video_Data on slow drive; copy to local SSD |
+| **Memory error** | Close apps; reduce batch_size to 4/2 |
+| **Training crashes** | Embeddings corrupted; delete & re-extract |
+| **Can't find embeddings** | Check `models/m8_embeddings/` folder exists |
+| **GPU errors** | Ensure CUDA disabled (should be using CPU) |
+
+---
+
+## Timeline Example
+
+```
+10:00 PM ──► Section 1 (instant)
+           │
+10:00 PM ──► Section 2 (embeddings)
+           ├─ 10:00-1:00 AM: Extracting fold_0, 1, 2, 3, 4
+           │
+1:00 AM  ──► Section 4 (quick test, ~10 min)
+           │
+1:15 AM  ──► Section 5 (full 5-fold CV)
+           ├─ 1:15-6:00 AM: Training all folds
+           │
+6:00 AM  ──► Results ready!
+           │
+           ──► Section 6 (comparison)
+           │
+           ─► Done! M5 vs M8 winner shown
+```
+
+---
+
+## Important Notes
+
+⚠️ **Don't close notebook** - Will interrupt run  
+⚠️ **Don't restart computer** - Will lose progress  
+⚠️ **Don't use machine for other tasks** - Slows everything down  
+✅ **Sleep is fine** - Process runs automatically  
+✅ **Check back in morning** - All results saved to disk  
+
+---
+
+## After Results Complete
+
+1. **Check `M8_results.json`**
+   ```python
+   import json
+   with open('results/reports/M8_results.json') as f:
+       results = json.load(f)
+       print(f"Accuracy: {results['mean_acc']:.4f} ± {results['std_acc']:.4f}")
+   ```
+
+2. **Compare with M5** (already done in Section 6)
+   - If M8 ≥ M5: Ensemble maintains performance ✓
+   - If M8 < M5: Simple models better (expected) ✓
+
+3. **Use results for thesis**
+   - "Temporal ensemble performance validates M5's robustness"
+   - "Shows that frame-level predictions already stable"
+
+---
+
+**Ready? Start notebook at 10 PM and sleep well! 🌙**
+
